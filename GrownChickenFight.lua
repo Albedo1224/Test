@@ -10,8 +10,9 @@ local Workspace         = game:GetService("Workspace")
 -- Constants
 --------------------------------------------------------------------------------
 local RETRY_SECONDS   = 0.8      -- main loop (slightly faster)
-local UPGRADE_SECONDS = 0.35     -- upgrade loop (slightly faster)
+local UPGRADE_SECONDS = 0.05     -- near-instant upgrade checks
 local WAIT_SECONDS    = 12       -- waitFor timeout
+local HEAL_WAIT_SECONDS = 90     -- low-health chickens need about a minute at Coop
 local POLL_INTERVAL   = 0.08     -- waitFor polling (was 0.1)
 
 --------------------------------------------------------------------------------
@@ -24,10 +25,11 @@ local playerScripts = player:WaitForChild("PlayerScripts")
 local remotes        = require(ReplicatedStorage.Core.Remotes)
 local dataClient     = require(ReplicatedStorage.Packages.DataService).client
 local rebirthBonus   = require(ReplicatedStorage.Core.Progression.RebirthBonus)
+local gameConfig     = require(ReplicatedStorage.Content.GameConfig)
+local towerFloor     = require(ReplicatedStorage.Features.Battle.tower.TowerFloor)
 local coopView       = require(ReplicatedStorage.Features.Coop.CoopView)
 local recyclerView   = require(ReplicatedStorage.Features.Scrap.RecyclerView)
 local incubatorView  = require(ReplicatedStorage.Features.Incubator.IncubatorView)
-local chickenBodyProxy = require(ReplicatedStorage.Features.Chicken.ChickenBodyProxy)
 local dataController = require(playerScripts.Core.Data.DataController)
 local chickenMode    = require(playerScripts:WaitForChild("Features")
                         :WaitForChild("Chicken"):WaitForChild("ChickenMode"))
@@ -283,8 +285,8 @@ local function invokeOk(definition, ...)
     return not err and result and (result.ok ~= false), err
 end
 
-local function waitFor(check)
-    local deadline = os.clock() + WAIT_SECONDS
+local function waitFor(check, timeout)
+    local deadline = os.clock() + (timeout or WAIT_SECONDS)
     while os.clock() < deadline do
         if check() then return true end
         task.wait(POLL_INTERVAL)
@@ -292,38 +294,45 @@ local function waitFor(check)
     return false
 end
 
-local function waitForChickenAtCoop(chickenId)
+local function waitForChickenAtCoop(chickenId, healFull)
     chickenMode.order("coop")
     remotes.fire(remotes.defs.SetChickenOrder, "coop")
 
-    local nextOrder = os.clock() + 0.5
+    local nextOrder = os.clock() + 2
     local stableAt
+    local lastPosition
     return waitFor(function()
         local now = os.clock()
-        local atCoop = false
+        local position
+        local roster = dataController.roster()
         for body, stats in chickenOverlay.bodies() do
-            if stats.owner == player.UserId
-                and body:GetAttribute(chickenBodyProxy.Attr.EntityId) == chickenId
+            if roster and roster.activeId == chickenId
+                and stats.owner == player.UserId
                 and stats.state == "corral"
+                and (not healFull or (stats.hpFrac or 1) >= 0.999)
             then
-                atCoop = true
+                position = body.Position
                 break
             end
         end
 
-        if atCoop then
-            stableAt = stableAt or now
-            return now - stableAt >= 0.35
+        if position then
+            local delta = lastPosition and position - lastPosition
+            local stopped = delta and Vector3.new(delta.X, 0, delta.Z).Magnitude <= 0.1
+            stableAt = stopped and (stableAt or now) or nil
+            lastPosition = position
+            return stableAt and now - stableAt >= 0.8
         end
 
         stableAt = nil
+        lastPosition = nil
         if now >= nextOrder then
             chickenMode.order("coop")
             remotes.fire(remotes.defs.SetChickenOrder, "coop")
-            nextOrder = now + 0.5
+            nextOrder = now + 2
         end
         return false
-    end)
+    end, healFull and HEAL_WAIT_SECONDS or WAIT_SECONDS)
 end
 
 local function getArena()
@@ -359,6 +368,44 @@ end
 
 local function getMoney()
     return dataController.money():toNumber()
+end
+
+local function elevatorCost(floor)
+    local total = 0
+    for i = 1, floor - 1 do
+        total += towerFloor.at(i).money
+    end
+
+    local purchases = dataController.purchases()
+    local vip = purchases and purchases.passes and purchases.passes.elevatorVip == true
+    local elevator = gameConfig.premium.elevator
+    return math.max(0, math.floor(total * elevator.costFactor
+        * (1 - (vip and elevator.vipDiscount or 0)) + 0.5))
+end
+
+local function chooseElevatorFloor()
+    local elevator = gameConfig.premium.elevator
+    local chicken = dataController.chicken()
+    local best = dataController.towerBest() or 0
+
+    if not elevator.enabled or not chicken or (chicken.level or 1) < 2
+        or best < elevator.minFloor + 1
+    then
+        return nil, "BOTTOM"
+    end
+
+    local money = getMoney()
+    local front = best + 1
+    if money >= elevatorCost(front) then
+        return front, "FRONT"
+    end
+
+    local warm = math.max(elevator.minFloor, best - 4)
+    if warm < front - 1 and money >= elevatorCost(warm) then
+        return warm, "WARM"
+    end
+
+    return nil, "BOTTOM"
 end
 
 --------------------------------------------------------------------------------
@@ -632,7 +679,7 @@ end
 --------------------------------------------------------------------------------
 -- Assertions
 --------------------------------------------------------------------------------
-assert(RETRY_SECONDS >= 0.5 and UPGRADE_SECONDS >= 0.2 and WAIT_SECONDS >= RETRY_SECONDS,
+assert(RETRY_SECONDS >= 0.5 and UPGRADE_SECONDS >= 0.05 and WAIT_SECONDS >= RETRY_SECONDS,
     "Invalid auto tower timing")
 
 --------------------------------------------------------------------------------
@@ -671,11 +718,37 @@ task.spawn(function()
 
             elseif not isTowerActive() then
                 state.surrendered = false
-                chickenMode.order("tower")
-                setStatus("Starting tower...")
-                local _, err = invoke(remotes.defs.TowerStart)
-                if err and err ~= "busy" then
-                    setStatus("Tower error: " .. err)
+                local mode = state.mode
+                local ready = true
+
+                if mode == "farm" then
+                    local roster = dataController.roster()
+                    local chickenId = roster and roster.activeId
+                    setStatus("Farm: waiting for full health...")
+                    ready = chickenId and waitForChickenAtCoop(chickenId, true) or false
+                    if not ready then
+                        setStatus("Farm: heal timeout")
+                    end
+                end
+
+                if ready and state.enabled and state.mode == mode then
+                    state.busy = true
+                    local elevatorFloor, elevatorMode = chooseElevatorFloor()
+                    if elevatorFloor then
+                        setStatus("Elevator: " .. elevatorMode .. " " .. elevatorFloor)
+                        local _, elevatorErr = invoke(remotes.defs.TowerElevator, elevatorFloor)
+                        if elevatorErr then
+                            elevatorMode = "BOTTOM"
+                        end
+                    end
+
+                    chickenMode.order("tower")
+                    setStatus("Starting tower: " .. elevatorMode)
+                    local _, err = invoke(remotes.defs.TowerStart)
+                    if err and err ~= "busy" then
+                        setStatus("Tower error: " .. err)
+                    end
+                    state.busy = false
                 end
             else
                 setStatus("Fighting tower")
@@ -687,13 +760,12 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------------------
--- Upgrade Loop: Runs During Active Tower
+-- Upgrade Loop
 --------------------------------------------------------------------------------
 task.spawn(function()
     while state.alive and shared.AutoTowerState == state do
         if state.enabled
             and not state.busy
-            and isTowerActive()
             and (state.mode == "farm" or not isRebirthReady())
         then
             state.busy = true
