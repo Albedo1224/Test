@@ -27,9 +27,11 @@ local rebirthBonus   = require(ReplicatedStorage.Core.Progression.RebirthBonus)
 local coopView       = require(ReplicatedStorage.Features.Coop.CoopView)
 local recyclerView   = require(ReplicatedStorage.Features.Scrap.RecyclerView)
 local incubatorView  = require(ReplicatedStorage.Features.Incubator.IncubatorView)
+local chickenBodyProxy = require(ReplicatedStorage.Features.Chicken.ChickenBodyProxy)
 local dataController = require(playerScripts.Core.Data.DataController)
 local chickenMode    = require(playerScripts:WaitForChild("Features")
                         :WaitForChild("Chicken"):WaitForChild("ChickenMode"))
+local chickenOverlay = require(playerScripts.Features.Chicken.ChickenOverlay)
 
 --------------------------------------------------------------------------------
 -- Anti-Cheat Blocker (single-instance guard)
@@ -290,6 +292,40 @@ local function waitFor(check)
     return false
 end
 
+local function waitForChickenAtCoop(chickenId)
+    chickenMode.order("coop")
+    remotes.fire(remotes.defs.SetChickenOrder, "coop")
+
+    local nextOrder = os.clock() + 0.5
+    local stableAt
+    return waitFor(function()
+        local now = os.clock()
+        local atCoop = false
+        for body, stats in chickenOverlay.bodies() do
+            if stats.owner == player.UserId
+                and body:GetAttribute(chickenBodyProxy.Attr.EntityId) == chickenId
+                and stats.state == "corral"
+            then
+                atCoop = true
+                break
+            end
+        end
+
+        if atCoop then
+            stableAt = stableAt or now
+            return now - stableAt >= 0.35
+        end
+
+        stableAt = nil
+        if now >= nextOrder then
+            chickenMode.order("coop")
+            remotes.fire(remotes.defs.SetChickenOrder, "coop")
+            nextOrder = now + 0.5
+        end
+        return false
+    end)
+end
+
 local function getArena()
     local plot   = player:GetAttribute("Plot")
     local arenas = Workspace:FindFirstChild("Arenas")
@@ -421,6 +457,7 @@ local function prepareAndRebirth()
 
     local roster   = dataController.roster()
     local chickens = roster and roster.chickens or {}
+    local towerChickenId = roster and roster.activeId
     local incubator = dataClient:get({ "incubator" })
 
     if type(incubator) ~= "table" or (incubator.level or 0) < 1 then
@@ -459,9 +496,7 @@ local function prepareAndRebirth()
 
     -- Recall the current tower chicken before changing the active slot.
     setStatus("Waiting current chicken at Coop...")
-    chickenMode.order("coop")
-    remotes.fire(remotes.defs.SetChickenOrder, "coop")
-    if not waitFor(function() return chickenMode.where() == "corral" end) then
+    if not towerChickenId or not waitForChickenAtCoop(towerChickenId) then
         setStatus("Current chicken did not reach Coop")
         state.busy = false
         return
@@ -480,9 +515,7 @@ local function prepareAndRebirth()
     end
 
     -- Keep the newly deployed backup at Coop as well.
-    chickenMode.order("coop")
-    remotes.fire(remotes.defs.SetChickenOrder, "coop")
-    if not waitFor(function() return chickenMode.where() == "corral" end) then
+    if not waitForChickenAtCoop(deployed.id) then
         setStatus("Chicken not at Flock")
         state.busy = false
         return
