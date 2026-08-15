@@ -457,6 +457,16 @@ local function prepareAndRebirth()
         return
     end
 
+    -- Recall the current tower chicken before changing the active slot.
+    setStatus("Waiting current chicken at Coop...")
+    chickenMode.order("coop")
+    remotes.fire(remotes.defs.SetChickenOrder, "coop")
+    if not waitFor(function() return chickenMode.where() == "corral" end) then
+        setStatus("Current chicken did not reach Coop")
+        state.busy = false
+        return
+    end
+
     -- Deploy backup
     setStatus("Deploying backup chicken...")
     local _, err = invoke(remotes.defs.SetActiveChicken, deployed.id)
@@ -469,7 +479,7 @@ local function prepareAndRebirth()
         return
     end
 
-    -- Send to coop
+    -- Keep the newly deployed backup at Coop as well.
     chickenMode.order("coop")
     remotes.fire(remotes.defs.SetChickenOrder, "coop")
     if not waitFor(function() return chickenMode.where() == "corral" end) then
